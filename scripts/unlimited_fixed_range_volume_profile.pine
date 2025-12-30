@@ -1,0 +1,204 @@
+//@version=5
+indicator(
+     "Unlimited Fixed Range Volume Profile",
+     overlay=true,
+     max_bars_back=50000,
+     max_boxes_count=500,
+     max_labels_count=100)
+
+// === Inputs ===
+start_time    = input.time(timestamp("2023-01-01T00:00:00"), "Range start", tooltip="Select the first bar of the fixed range.")
+use_end_time  = input.bool(true, "Lock range end", tooltip="Disable to keep the range open on the right.")
+end_time      = input.time(timestamp("2023-12-31T23:59:59"), "Range end", confirm=true, tooltip="Select the last bar of the fixed range when the end is locked.")
+price_step    = input.float(syminfo.mintick, "Price step", minval=syminfo.mintick, tooltip="Granularity of the price bins. Typically keep it equal to the symbol tick size or a multiple of it.")
+max_bins      = input.int(300, "Max price bins", minval=50, maxval=450, tooltip="Hard cap for the number of price levels stored in the histogram to avoid TradingView object limits.")
+max_width     = input.int(40, "Max width (bars)", minval=5, maxval=200, tooltip="Maximum width of the largest volume column measured in bars.")
+segments_cap  = input.int(50, "Segments per candle", minval=1, maxval=200, tooltip="Maximum number of price segments a single candle is split into when distributing volume.")
+show_labels   = input.bool(true, "Show key levels", tooltip="Print labels for Point of Control, Value Area High and Value Area Low.")
+value_area    = input.float(70.0, "Value area %", minval=10.0, maxval=99.0, tooltip="Percentage of volume considered part of the value area.")
+
+// === Storage ===
+var range_start_index = na
+var range_end_index   = na
+var bool  collecting  = false
+var bool  range_completed = false
+
+var array<int>   price_keys = array.new_int()
+var array<float> total_vol  = array.new_float()
+
+var array<box> boxes = array.new_box(0)
+var label poc_label = na
+var label vah_label = na
+var label val_label = na
+
+// === Utility functions ===
+int f_find_key(int key) => array.indexof(price_keys, key)
+
+f_reset() =>
+    array.clear(price_keys)
+    array.clear(total_vol)
+    while array.size(boxes) > 0
+        box.delete(array.pop(boxes))
+    if not na(poc_label)
+        label.delete(poc_label)
+        poc_label := na
+    if not na(vah_label)
+        label.delete(vah_label)
+        vah_label := na
+    if not na(val_label)
+        label.delete(val_label)
+        val_label := na
+    range_start_index := na
+    range_end_index := na
+    collecting := false
+    range_completed := false
+
+f_add_volume(float price, float vol) =>
+    int key = int(math.round(price / price_step))
+    int idx = f_find_key(key)
+    if idx == -1
+        if array.size(price_keys) < max_bins
+            array.push(price_keys, key)
+            array.push(total_vol, vol)
+    else
+        array.set(total_vol, idx, array.get(total_vol, idx) + vol)
+
+f_sort_bins() =>
+    int n = array.size(price_keys)
+    for i = 0 to n - 1
+        int min_idx = i
+        int key_i = array.get(price_keys, i)
+        for j = i + 1 to n - 1
+            int key_j = array.get(price_keys, j)
+            if key_j < key_i
+                key_i := key_j
+                min_idx := j
+        if min_idx != i
+            int temp_key = array.get(price_keys, i)
+            float temp_vol = array.get(total_vol, i)
+            array.set(price_keys, i, array.get(price_keys, min_idx))
+            array.set(total_vol, i, array.get(total_vol, min_idx))
+            array.set(price_keys, min_idx, temp_key)
+            array.set(total_vol, min_idx, temp_vol)
+
+float f_price_from_key(int key) => key * price_step
+
+f_cleanup_labels() =>
+    if not show_labels
+        if not na(poc_label)
+            label.delete(poc_label)
+            poc_label := na
+        if not na(vah_label)
+            label.delete(vah_label)
+            vah_label := na
+        if not na(val_label)
+            label.delete(val_label)
+            val_label := na
+
+f_draw_histogram() =>
+    int size = array.size(price_keys)
+    if size == 0
+        return
+    f_sort_bins()
+    float maxVol = 0.0
+    for i = 0 to size - 1
+        maxVol := math.max(maxVol, array.get(total_vol, i))
+    if maxVol == 0.0
+        return
+
+    int anchor = na(range_end_index) ? bar_index : range_end_index
+    float poc_price = na
+    float poc_volume = -1.0
+
+    float totalVolume = 0.0
+    for i = 0 to size - 1
+        totalVolume += array.get(total_vol, i)
+    float targetVolume = totalVolume * value_area * 0.01
+
+    float cumulative = 0.0
+    float vah_price = na
+    float val_price = na
+
+    for i = 0 to size - 1
+        float price = f_price_from_key(array.get(price_keys, i))
+        float vol = array.get(total_vol, i)
+        float width = max_width * (vol / maxVol)
+        float half_step = price_step * 0.5
+        box b = na
+        if array.size(boxes) > i
+            b := array.get(boxes, i)
+        if na(b)
+            b := box.new(anchor + 1, price + half_step, anchor + 1 + width, price - half_step, border_color = color.new(color.blue, 100), bgcolor = color.new(color.blue, 70))
+            array.push(boxes, b)
+        else
+            box.set_lefttop(b, anchor + 1, price + half_step)
+            box.set_rightbottom(b, anchor + 1 + width, price - half_step)
+        if vol > poc_volume
+            poc_volume := vol
+            poc_price := price
+        cumulative += vol
+        if na(vah_price) and cumulative >= targetVolume * 0.5
+            vah_price := price
+        if na(val_price) and cumulative >= targetVolume
+            val_price := price
+    while array.size(boxes) > size
+        box.delete(array.pop(boxes))
+
+    f_cleanup_labels()
+
+    if show_labels and not na(poc_price)
+        labelStyle = label.style_label_right
+        labelColor = color.new(color.blue, 10)
+        textColor = color.white
+        if na(poc_label)
+            poc_label := label.new(anchor + 1 + max_width, poc_price, "POC", style=labelStyle, textcolor=textColor, color=labelColor)
+        else
+            label.set_x(poc_label, anchor + 1 + max_width)
+            label.set_y(poc_label, poc_price)
+        if not na(vah_price)
+            if na(vah_label)
+                vah_label := label.new(anchor + 1 + max_width, vah_price, "VAH", style=labelStyle, textcolor=textColor, color=labelColor)
+            else
+                label.set_x(vah_label, anchor + 1 + max_width)
+                label.set_y(vah_label, vah_price)
+        if not na(val_price)
+            if na(val_label)
+                val_label := label.new(anchor + 1 + max_width, val_price, "VAL", style=labelStyle, textcolor=textColor, color=labelColor)
+            else
+                label.set_x(val_label, anchor + 1 + max_width)
+                label.set_y(val_label, val_price)
+
+// === Reset when inputs change ===
+if ta.change(start_time) or ta.change(use_end_time) or ta.change(end_time) or ta.change(price_step) or ta.change(max_bins)
+    f_reset()
+
+// === Range management ===
+bool start_hit = not collecting and time >= start_time and (bar_index == 0 or na(time[1]) or time[1] < start_time)
+
+if start_hit
+    f_reset()
+    collecting := true
+    range_start_index := bar_index
+
+if collecting
+    bool inside = time >= start_time and (not use_end_time or time <= end_time)
+    if inside
+        float bar_range = math.max(high - low, price_step)
+        int segments = int(math.ceil(bar_range / price_step))
+        segments := math.max(1, math.min(segments, segments_cap))
+        float segment_size = bar_range / segments
+        float segment_volume = volume / segments
+        for seg = 0 to segments - 1
+            float price = low + (seg + 0.5) * segment_size
+            f_add_volume(price, segment_volume)
+        range_end_index := bar_index
+    else
+        collecting := false
+        range_completed := true
+
+if not collecting and range_completed
+    f_draw_histogram()
+else if collecting
+    f_draw_histogram()
+
+plot(na)
